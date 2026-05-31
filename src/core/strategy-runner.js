@@ -208,13 +208,37 @@ export async function runStrategy({ source }) {
     }
   }
 
-  // Step 5: strategy-tester 탭 전환 → 결과 읽기 → pine-editor 복귀
-  // strategy-tester 탭 열어야 DOM에 메트릭 렌더링됨 (reportData() 폴백도 안정화)
-  // 읽기 후 pine-editor 복귀 → 다음 반복에서 에디터 재오픈 불필요
+  // Step 5: strategy-tester 탭 전환 → DOM 렌더링 polling → 결과 읽기 → pine-editor 복귀
   try { await openPanel({ panel: 'strategy-tester', action: 'open' }); } catch {}
-  await new Promise(r => setTimeout(r, 2000));
 
-  const resultsResult = await withAutoRecovery(() => getStrategyResults(), 'data_get_strategy_results');
+  // 고정 대기 대신 DOM polling — reportContainer + value 셀 등장까지 최대 10초
+  for (let i = 0; i < 20; i++) {
+    const ready = await evaluate(`
+      (function() {
+        var area = document.querySelector('[class*="reportContainer"],[data-name="strategy-tester"],[class*="StrategyTester"]');
+        if (!area) return false;
+        return area.querySelectorAll('[class*="value"],[class*="Cell"]').length > 0;
+      })()
+    `).catch(() => false);
+    if (ready) break;
+    await new Promise(r => setTimeout(r, 500));
+  }
+
+  // metric_count=0 시 최대 3회 재시도 (1초 간격)
+  let resultsResult;
+  for (let retry = 0; retry < 3; retry++) {
+    resultsResult = await withAutoRecovery(() => getStrategyResults(), 'data_get_strategy_results');
+    if (resultsResult?.action_required) return resultsResult;
+    if ((resultsResult?.metric_count || 0) > 0) break;
+    if (retry < 2) await new Promise(r => setTimeout(r, 1000));
+  }
+  // 3회 후에도 0 → 패널 재열기 1회 추가 시도
+  if ((resultsResult?.metric_count || 0) === 0) {
+    try { await openPanel({ panel: 'strategy-tester', action: 'open' }); } catch {}
+    await new Promise(r => setTimeout(r, 2000));
+    const fallback = await withAutoRecovery(() => getStrategyResults(), 'data_get_strategy_results');
+    if (!fallback?.action_required) resultsResult = fallback;
+  }
   if (resultsResult?.action_required) return resultsResult;
 
   // pine-editor 탭 복귀 — 다음 runStrategy 호출 시 Step 2 openPanel 중복 방지
