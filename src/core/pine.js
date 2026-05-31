@@ -48,6 +48,30 @@ export async function ensurePineEditorOpen() {
   `);
   if (already) return true;
 
+  // 차트 탭 여부 확인 — 새 탭/홈이면 Page.navigate()로 /chart로 이동
+  const onChart = await evaluate(
+    `String(window.location.href).includes('/chart') || !!(window.TradingView && window.TradingView.bottomWidgetBar)`
+  ).catch(() => false);
+
+  if (!onChart) {
+    process.stderr.write('[pine] 차트 탭 아님 — tradingview.com/chart 로 CDP 네비게이트\n');
+    const c = await getClient();
+    try {
+      await c.Page.navigate({ url: 'https://www.tradingview.com/chart/' });
+      // 네비게이션 후 새 컨텍스트 로드 대기
+      await new Promise(r => setTimeout(r, 8000));
+    } catch (e) {
+      process.stderr.write(`[pine] Page.navigate 실패: ${e.message}\n`);
+    }
+  }
+
+  // TV 초기화 대기 — bottomWidgetBar 존재까지 최대 45초
+  for (let wait = 0; wait < 45; wait++) {
+    const bwbReady = await evaluate(`!!(window.TradingView && window.TradingView.bottomWidgetBar)`).catch(() => false);
+    if (bwbReady) break;
+    await new Promise(r => setTimeout(r, 1000));
+  }
+
   await evaluate(`
     (function() {
       var bwb = window.TradingView && window.TradingView.bottomWidgetBar;
@@ -281,42 +305,131 @@ export async function setSource({ source }) {
   return { success: true, lines_set: source.split('\n').length };
 }
 
+export class CompileButtonNotFoundError extends Error {
+  constructor() {
+    super('Compile button not found after 3 DOM attempts + keyboard shortcut.');
+    this.name = 'CompileButtonNotFoundError';
+    this.userMessage = [
+      'Pine Editor 컴파일 버튼을 찾지 못했습니다 (DOM 3회 + 키보드 단축키 모두 실패).',
+      '',
+      '다음 중 하나를 해주세요:',
+      '  1. "Add to chart" 또는 "Update on chart" 버튼을 직접 클릭해주세요.',
+      '  2. 버튼에 표시된 정확한 텍스트를 알려주세요.',
+      '  3. Pine Editor가 열려있고 스크립트가 로드된 상태인지 확인해주세요.',
+      '',
+      '⚠ 5분 내 응답이 없으면 TradingView가 자동으로 종료됩니다.',
+    ].join('\n');
+  }
+}
+
+async function clickCompileButton({ hasExistingStrategy = false } = {}) {
+  const isMac = process.platform === 'darwin';
+  const modifiers = isMac ? 4 : 2; // Meta(Cmd)=4, Ctrl=2
+  const c = await getClient();
+
+  // 기존 전략이 차트에 있으면 Cmd+Enter = "Update on chart" (전략 쌓임 없음)
+  // 기존 전략 없으면 DOM [data-qa-id="add-script-to-chart"] 클릭 (Save 다이얼로그 없음)
+  if (hasExistingStrategy) {
+    // Cmd+A로 에디터 전체 선택 후 Cmd+Enter — Monaco 포커스 필수
+    await evaluate(`
+      (function() {
+        var m = ${FIND_MONACO};
+        if (m && m.editor) { try { m.editor.focus(); } catch(e) {} }
+      })()
+    `);
+    await new Promise(r => setTimeout(r, 150));
+    await c.Input.dispatchKeyEvent({ type: 'keyDown', modifiers, key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+    await c.Input.dispatchKeyEvent({ type: 'keyUp', modifiers: 0, key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+    await new Promise(r => setTimeout(r, 1000));
+    process.stderr.write('[Pine] Cmd+Enter (Update on chart) 전송\n');
+    return { label: isMac ? 'Cmd+Enter(update)' : 'Ctrl+Enter(update)', method: 'keyboard_update' };
+  }
+
+  // 1순위: DOM 버튼 직접 클릭 — Save 다이얼로그 없이 작동 (테스트 검증됨)
+  // [data-qa-id="add-script-to-chart"] 는 text가 없어도 visible하면 클릭 가능
+  const FIND_COMPILE_BTN = `
+    (function() {
+      var qaBtn = document.querySelector('[data-qa-id="add-script-to-chart"]');
+      if (qaBtn && qaBtn.offsetParent !== null) { qaBtn.click(); return 'Add to chart (qa-id)'; }
+      var btns = document.querySelectorAll('button');
+      for (var i = 0; i < btns.length; i++) {
+        var text = btns[i].textContent.trim();
+        if (/(Add to chart|Update on chart)/i.test(text) && !/save/i.test(text)) {
+          btns[i].click(); return text;
+        }
+      }
+      return null;
+    })()
+  `;
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const clicked = await evaluate(FIND_COMPILE_BTN);
+    if (clicked) return { label: clicked, method: 'dom' };
+    if (attempt < 3) await new Promise(r => setTimeout(r, 500));
+  }
+
+  // 2순위: 키보드 단축키 폴백 (DOM 버튼 없을 때만)
+  await evaluate(`
+    (function() {
+      var closeSelectors = [
+        '[data-name="dialog-close"]', '.dialog-close-button',
+        'button[aria-label="Close"]', 'button[aria-label="닫기"]',
+      ];
+      for (var s of closeSelectors) {
+        var btn = document.querySelector(s);
+        if (btn && btn.offsetParent !== null) { btn.click(); break; }
+      }
+      var m = ${FIND_MONACO};
+      if (m && m.editor) {
+        try { m.editor.focus(); } catch(e) {}
+      }
+    })()
+  `);
+  await new Promise(r => setTimeout(r, 200));
+  await c.Input.dispatchKeyEvent({ type: 'keyDown', modifiers, key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+  await c.Input.dispatchKeyEvent({ type: 'keyUp', modifiers: 0, key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+  await new Promise(r => setTimeout(r, 1000));
+
+  // 키보드 성공 판단: Monaco 살아있고 + 차단 다이얼로그 없음
+  const keyboardOk = await evaluate(`
+    (function() {
+      var m = ${FIND_MONACO};
+      if (!m || !m.editor.getModel()) return false;
+      var closeSelectors = [
+        '[data-name="dialog-close"]', '.dialog-close-button',
+        'button[aria-label="Close"]', 'button[aria-label="닫기"]',
+      ];
+      for (var s of closeSelectors) {
+        var btn = document.querySelector(s);
+        if (btn && btn.offsetParent !== null) return false;
+      }
+      return true;
+    })()
+  `);
+  if (keyboardOk) return { label: isMac ? 'Cmd+Enter' : 'Ctrl+Enter', method: 'keyboard' };
+
+  // 3순위: 좌표 자가학습 — 오버레이 + Telegram 요청
+  try {
+    const { interactiveClick } = await import('./interactive-click.js');
+    const coord = await interactiveClick(
+      'add_to_chart_button',
+      '"Add to chart" 또는 "Update on chart" 버튼을 클릭해주세요'
+    );
+    if (coord) return { label: `learned(${coord.x},${coord.y})`, method: 'interactive' };
+  } catch (e) {
+    process.stderr.write(`[Pine] interactiveClick 실패: ${e.message}\n`);
+  }
+
+  throw new CompileButtonNotFoundError();
+}
+
 export async function compile() {
   const editorReady = await ensurePineEditorOpen();
   if (!editorReady) throw new Error('Could not open Pine Editor.');
 
-  const clicked = await evaluate(`
-    (function() {
-      var btns = document.querySelectorAll('button');
-      var fallback = null;
-      var saveBtn = null;
-      for (var i = 0; i < btns.length; i++) {
-        var text = btns[i].textContent.trim();
-        if (/save and add to chart/i.test(text)) {
-          btns[i].click();
-          return 'Save and add to chart';
-        }
-        if (!fallback && /^(Add to chart|Update on chart)/i.test(text)) {
-          fallback = btns[i];
-        }
-        if (!saveBtn && btns[i].className.indexOf('saveButton') !== -1 && btns[i].offsetParent !== null) {
-          saveBtn = btns[i];
-        }
-      }
-      if (fallback) { fallback.click(); return fallback.textContent.trim(); }
-      if (saveBtn) { saveBtn.click(); return 'Pine Save'; }
-      return null;
-    })()
-  `);
-
-  if (!clicked) {
-    const c = await getClient();
-    await c.Input.dispatchKeyEvent({ type: 'keyDown', modifiers: 2, key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
-    await c.Input.dispatchKeyEvent({ type: 'keyUp', key: 'Enter', code: 'Enter' });
-  }
-
+  const { label, method } = await clickCompileButton();
   await new Promise(r => setTimeout(r, 2000));
-  return { success: true, button_clicked: clicked || 'keyboard_shortcut', source: 'dom_fallback' };
+  return { success: true, button_clicked: label, method };
 }
 
 export async function getErrors() {
@@ -336,11 +449,12 @@ export async function getErrors() {
     })()
   `);
 
+  const realErrors = (errors || []).filter(e => e.severity >= 8);
   return {
     success: true,
-    has_errors: errors?.length > 0,
-    error_count: errors?.length || 0,
-    errors: errors || [],
+    has_errors: realErrors.length > 0,
+    error_count: realErrors.length,
+    errors: realErrors,
   };
 }
 
@@ -440,35 +554,8 @@ export async function smartCompile() {
     })()
   `);
 
-  const buttonClicked = await evaluate(`
-    (function() {
-      var btns = document.querySelectorAll('button');
-      var addBtn = null;
-      var updateBtn = null;
-      var saveBtn = null;
-      for (var i = 0; i < btns.length; i++) {
-        var text = btns[i].textContent.trim();
-        if (/save and add to chart/i.test(text)) {
-          btns[i].click();
-          return 'Save and add to chart';
-        }
-        if (!addBtn && /^add to chart$/i.test(text)) addBtn = btns[i];
-        if (!updateBtn && /^update on chart$/i.test(text)) updateBtn = btns[i];
-        if (!saveBtn && btns[i].className.indexOf('saveButton') !== -1 && btns[i].offsetParent !== null) saveBtn = btns[i];
-      }
-      if (addBtn) { addBtn.click(); return 'Add to chart'; }
-      if (updateBtn) { updateBtn.click(); return 'Update on chart'; }
-      if (saveBtn) { saveBtn.click(); return 'Pine Save'; }
-      return null;
-    })()
-  `);
-
-  if (!buttonClicked) {
-    const c = await getClient();
-    await c.Input.dispatchKeyEvent({ type: 'keyDown', modifiers: 2, key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
-    await c.Input.dispatchKeyEvent({ type: 'keyUp', key: 'Enter', code: 'Enter' });
-  }
-
+  const hasExisting = (studiesBefore !== null && studiesBefore > 0);
+  const { label: buttonClicked, method: buttonMethod } = await clickCompileButton({ hasExistingStrategy: hasExisting });
   await new Promise(r => setTimeout(r, 2500));
 
   const errors = await evaluate(`
@@ -494,13 +581,19 @@ export async function smartCompile() {
     })()
   `);
 
-  const studyAdded = (studiesBefore !== null && studiesAfter !== null) ? studiesAfter > studiesBefore : null;
+  // Update 모드(hasExisting=true)에서는 study 개수 변화 없음이 정상
+  // studiesAfter == studiesBefore → study_added=false 오판 방지 → null 반환
+  const studyAdded = hasExisting
+    ? null
+    : (studiesBefore !== null && studiesAfter !== null) ? studiesAfter > studiesBefore : null;
 
+  const realErrors = (errors || []).filter(e => e.severity >= 8);
   return {
     success: true,
-    button_clicked: buttonClicked || 'keyboard_shortcut',
-    has_errors: errors?.length > 0,
-    errors: errors || [],
+    button_clicked: buttonClicked,
+    method: buttonMethod,
+    has_errors: realErrors.length > 0,
+    errors: realErrors,
     study_added: studyAdded,
   };
 }
