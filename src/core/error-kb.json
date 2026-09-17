@@ -1,0 +1,79 @@
+[
+  {
+    "id": "cdp-fetch-failed",
+    "pattern": "CDP connection failed",
+    "tool": "*",
+    "fix": "TV CDP 연결 끊김 — tv_launch(kill_existing=true) 후 재시도",
+    "auto_steps": [
+      "tv_launch"
+    ],
+    "added": "2026-05-30",
+    "source": "session"
+  },
+  {
+    "id": "pine-editor-not-found",
+    "pattern": "Could not open Pine Editor",
+    "tool": "*",
+    "fix": "bottomWidgetBar 미초기화 — tv_launch 후 ui_open_panel 재시도",
+    "auto_steps": [
+      "tv_launch",
+      "ui_open_panel"
+    ],
+    "added": "2026-05-30",
+    "source": "fix"
+  },
+  {
+    "id": "strategy-results-empty",
+    "pattern": "No strategy found on chart",
+    "tool": "data_get_strategy_results",
+    "fix": "internal_api가 study 감지 실패 — DOM 스크래핑으로 fallback",
+    "auto_steps": [
+      "dom_fallback"
+    ],
+    "added": "2026-05-30",
+    "source": "session"
+  },
+  {
+    "id": "study-not-added-save-dialog",
+    "pattern": "study not added to chart",
+    "tool": "pine_smart_compile",
+    "fix": "Save 다이얼로그 닫기 후 Add to chart DOM 버튼 직접 클릭. 자동 복구 실패 시 사용자 수동 클릭 필요.",
+    "auto_steps": [
+      "dismiss_dialog_retry_compile"
+    ],
+    "added": "2026-05-31",
+    "source": "auto"
+  },
+  {
+    "id": "optimal-strategy-run-flow",
+    "pattern": "pine_strategy_run_optimal",
+    "tool": "pine_strategy_run",
+    "fix": "최단시간 성공 패턴(2026-05-31 검증): 1) open_pine_editor 1회 2) loop: run_strategy() → DOM [data-qa-id=add-script-to-chart] 클릭 → strategy-tester 열기 → 결과 파싱 → pine-editor 복귀. Cmd+Enter 사용 안함. 에디터 한 번만 열고 전체 루프 유지.",
+    "auto_steps": [],
+    "added": "2026-05-31",
+    "source": "ai"
+  },
+  {
+    "id": "cdp-port-conflict-antigravity",
+    "pattern": "CDP 포트는 열려있으나 차트 탭 없음",
+    "tool": "ensure_tv_ready",
+    "fix": "기본 포트 9222가 Google Chrome 등 타 브라우저에 선점되어 TradingView가 바인딩되지 못함. 전용 포트 9229로 전환 후 tv_launch(port=9229) 재기동.",
+    "auto_steps": [
+      "switch_port_9229",
+      "tv_launch"
+    ],
+    "added": "2026-09-17",
+    "source": "incident_resolution"
+  },
+  {
+    "id": "tg-legacy-import-error",
+    "pattern": "name 'Path' is not defined",
+    "tool": "tv16_telegram",
+    "fix": "폐기된 connector/messenger/telegram 모듈 참조로 인한 임포트 실패. 인라인 SimpleFloodGuard로 대체하여 독립 동작 보장.",
+    "auto_steps": [
+      "inline_flood_guard"
+    ],
+    "added": "2026-09-17",
+    "source": "incident_resolution"
+  }
+]
