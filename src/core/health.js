@@ -160,7 +160,7 @@ export async function uiState() {
 }
 
 export async function launch({ port, kill_existing } = {}) {
-  const cdpPort = port || 9222;
+  const cdpPort = port || (process.env.TV_CDP_PORT ? parseInt(process.env.TV_CDP_PORT, 10) : 9229);
   const killFirst = kill_existing !== false;
   const platform = process.platform;
 
@@ -213,8 +213,9 @@ export async function launch({ port, kill_existing } = {}) {
 
   if (killFirst) {
     try {
-      if (platform === 'win32') execSync('taskkill /F /IM TradingView.exe', { timeout: 5000 });
-      else execSync('pkill -f TradingView', { timeout: 5000 });
+      if (platform === 'win32') execSync('taskkill /F /T /IM TradingView.exe', { timeout: 5000 });
+      else if (platform === 'darwin') execSync('pkill -9 -f "TradingView.app"', { timeout: 5000 });
+      else execSync('pkill -9 -f tradingview', { timeout: 5000 });
       await new Promise(r => setTimeout(r, 1500));
     } catch { /* may not be running */ }
   }

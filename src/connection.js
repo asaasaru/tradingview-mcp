@@ -2,8 +2,9 @@ import CDP from 'chrome-remote-interface';
 
 let client = null;
 let targetInfo = null;
+let targetVerified = false; // 바운드 타깃이 차트 페이지임을 1회 확인했는지
 const CDP_HOST = 'localhost';
-const CDP_PORT = 9222;
+const CDP_PORT = process.env.TV_CDP_PORT ? parseInt(process.env.TV_CDP_PORT, 10) : 9229;
 const MAX_RETRIES = 5;
 const BASE_DELAY = 500;
 
@@ -33,16 +34,47 @@ export async function getClient() {
     try {
       // Quick liveness check
       await client.Runtime.evaluate({ expression: '1', returnByValue: true });
-      return client;
     } catch {
+      // 연결이 죽음 → 재연결
       client = null;
       targetInfo = null;
+      targetVerified = false;
+      return connect();
     }
+    // 이미 차트 페이지로 확인된 타깃이면 추가 검사 없이 재사용.
+    if (targetVerified) return client;
+    // 최초 1회: 바운드 타깃이 실제 차트 페이지인지 확인.
+    const onChart = await client.Runtime.evaluate({
+      expression: 'String(location.href).includes("/chart") || !!(window.TradingView && window.TradingView.bottomWidgetBar)',
+      returnByValue: true,
+    }).then(r => r.result && r.result.value === true).catch(() => false);
+    if (onChart) { targetVerified = true; return client; }
+    // 차트 탭 아님 → 차트 탭으로 재바인딩 (findChartTarget이 90초 내 폴링).
+    process.stderr.write('[connection] 비차트 탭 감지 — 차트 탭 재탐색 중...\n');
+    try { await client.close(); } catch {}
+    client = null;
+    targetInfo = null;
+    targetVerified = false;
+    return connect();
   }
   return connect();
 }
 
+// 지금 떠 있는 차트 탭만 (블로킹 없이) 즉시 반환. 없으면 null.
+async function findExistingChartTarget() {
+  const resp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
+  const targets = await resp.json();
+  return targets.find(t => t.type === 'page' && /tradingview\.com\/chart/i.test(t.url)) || null;
+}
+
 export async function connect() {
+  // Fast-fail: if CDP port is not accepting connections at all, skip retries entirely.
+  try {
+    await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/version`);
+  } catch {
+    throw new Error(`TradingView is not running with CDP enabled (port ${CDP_PORT} not open). Use the tv_launch tool to start it.`);
+  }
+
   let lastError;
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     try {
@@ -51,6 +83,7 @@ export async function connect() {
         throw new Error('No TradingView chart target found. Is TradingView open with a chart?');
       }
       targetInfo = target;
+      targetVerified = /tradingview\.com\/chart/i.test(target.url || '');
       client = await CDP({ host: CDP_HOST, port: CDP_PORT, target: target.id });
 
       // Enable required domains
@@ -69,12 +102,21 @@ export async function connect() {
 }
 
 async function findChartTarget() {
-  const resp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
-  const targets = await resp.json();
-  // Prefer targets with tradingview.com/chart in the URL
-  return targets.find(t => t.type === 'page' && /tradingview\.com\/chart/i.test(t.url))
-    || targets.find(t => t.type === 'page' && /tradingview/i.test(t.url))
-    || null;
+  // TV 앱은 시작 후 60초 내외에 tradingview.com/chart 탭을 자체 로드한다.
+  // new-tab/window 같은 내부 file:// 탭에 잘못 바인딩하지 않도록
+  // 차트 탭이 나타날 때까지 최대 90초 폴링한다.
+  const POLL_MS = 3000;
+  const DEADLINE = Date.now() + 90000;
+  while (Date.now() < DEADLINE) {
+    const resp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
+    const targets = await resp.json();
+    const chart = targets.find(t => t.type === 'page' && /tradingview\.com\/chart/i.test(t.url));
+    if (chart) return chart;
+    process.stderr.write('[connection] tradingview.com/chart 탭 대기 중...\n');
+    await new Promise(r => setTimeout(r, POLL_MS));
+  }
+  // 90초 후에도 없으면 null — 상위에서 에러 처리
+  return null;
 }
 
 export async function getTargetInfo() {
@@ -110,7 +152,22 @@ export async function disconnect() {
     try { await client.close(); } catch {}
     client = null;
     targetInfo = null;
+    targetVerified = false;
+    }
+}
+
+/**
+ * 캐시된 타깃/클라이언트를 강제 무효화한다.
+ * action_required(예: Pine Editor 못 엶) 후 사용자 수동 조치 뒤 재시도 시 호출하면
+ * 다음 getClient()가 차트 탭을 새로 탐색·바인딩한다.
+ */
+export async function resetTarget() {
+  if (client) {
+    try { await client.close(); } catch {}
   }
+  client = null;
+  targetInfo = null;
+  targetVerified = false;
 }
 
 // --- Direct API path helpers ---
