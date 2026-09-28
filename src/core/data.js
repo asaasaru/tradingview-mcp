@@ -132,6 +132,103 @@ export async function getIndicator({ entity_id }) {
   return { success: true, entity_id, visible: data?.visible, inputs };
 }
 
+const DOM_STRATEGY_SCRAPE = `
+  (function() {
+    var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    var texts = [];
+    var node;
+    while ((node = walker.nextNode())) {
+      var txt = node.textContent.trim();
+      if (!txt) continue;
+      if (/^[+-]?[\d,]+\.\d{2}$/.test(txt) || /^[+-]?\d+\.\d+%$/.test(txt) ||
+          /^\d+ trades?$/i.test(txt) || /^[\d.]{1,8}$/.test(txt)) {
+        texts.push(txt);
+      }
+    }
+    return [...new Set(texts)];
+  })()
+`;
+
+function parseStrategyDom(texts) {
+  const metrics = {};
+  for (const t of texts) {
+    if (/^\+[\d,]+\.\d{2}$/.test(t) && metrics.net_profit === undefined)
+      metrics.net_profit = parseFloat(t.replace(/[+,]/g, ''));
+    else if (/^\+\d+\.\d+%$/.test(t) && metrics.net_profit_pct === undefined)
+      metrics.net_profit_pct = parseFloat(t.replace(/[+%]/g, ''));
+    else if (/^\d{1,3}(?:,\d{3})+\.\d{2}$/.test(t) && metrics.max_drawdown === undefined)
+      metrics.max_drawdown = parseFloat(t.replace(/,/g, ''));
+    else if (/^\d+\.\d+%$/.test(t) && metrics.win_rate === undefined)
+      metrics.win_rate = parseFloat(t.replace('%', ''));
+    const tradeM = t.match(/^(\d+)\s+trades?$/i);
+    if (tradeM) {
+      if (metrics.long_trades === undefined) metrics.long_trades = parseInt(tradeM[1]);
+      else if (metrics.short_trades === undefined) metrics.short_trades = parseInt(tradeM[1]);
+    }
+  }
+  if (metrics.long_trades !== undefined && metrics.short_trades !== undefined)
+    metrics.total_closed_trades = metrics.long_trades + metrics.short_trades;
+  return metrics;
+}
+
+// 라벨+value+change 세트 기반 Strategy Tester 파싱
+const DOM_LABEL_VALUE_SCRAPE = `
+  (function() {
+    var area = document.querySelector('[class*="reportContainer"],[class*="StrategyTester"],[data-name="strategy-tester"]');
+    if (!area) return null;
+    var seen = {};
+    var result = [];
+    var sections = Array.from(area.querySelectorAll('[class*="container"],[class*="item"],[class*="row"],[class*="Cell"]'));
+    sections.forEach(function(sec) {
+      var t = sec.querySelector('[class*="title"]');
+      var change = sec.querySelector('[class*="change"]');
+      var value = sec.querySelector('[class*="value"]');
+      if (t && t.children.length === 0) {
+        var label = t.textContent.trim();
+        if (label && label.length < 50 && !seen[label]) {
+          seen[label] = true;
+          result.push({
+            label: label,
+            value: value ? value.textContent.trim() : null,
+            change: change ? change.textContent.trim() : null
+          });
+        }
+      }
+    });
+    return result;
+  })()
+`;
+
+function parseLabelValuePairs(pairs) {
+  if (!Array.isArray(pairs)) return {};
+  const metrics = {};
+  const _float = (v) => { if (!v) return null; const n = parseFloat(v.replace(/[+,%,]/g, '').replace('−', '-')); return isNaN(n) ? null : n; };
+  for (const p of pairs) {
+    const label = (p.label || '').toLowerCase();
+    const val = p.value || '';
+    const change = p.change || '';
+    if (label.includes('total pnl') || label.includes('net profit')) {
+      if (val && metrics.net_profit === undefined) metrics.net_profit = _float(val);
+      if (change.includes('%') && metrics.net_profit_pct === undefined) metrics.net_profit_pct = _float(change);
+    } else if (label.includes('drawdown')) {
+      if (val && metrics.max_drawdown === undefined) metrics.max_drawdown = _float(val);
+    } else if (label.includes('profitable')) {
+      if (val.includes('%') && metrics.win_rate === undefined) metrics.win_rate = _float(val);
+      if (change.includes('/') && metrics.total_closed_trades === undefined) {
+        const parts = change.split('/');
+        const n = parseInt(parts[1].replace(/,/g, ''));
+        if (!isNaN(n)) metrics.total_closed_trades = n;
+      }
+    } else if (label.includes('profit factor')) {
+      if (val && metrics.profit_factor === undefined) metrics.profit_factor = _float(val);
+    } else if (label.includes('total trades')) {
+      const n = parseInt(val.replace(/,/g, ''));
+      if (!isNaN(n) && metrics.total_closed_trades === undefined) metrics.total_closed_trades = n;
+    }
+  }
+  return metrics;
+}
+
 export async function getStrategyResults() {
   const results = await evaluate(`
     (function() {
@@ -161,6 +258,29 @@ export async function getStrategyResults() {
       } catch(e) { return {metrics: {}, source: 'internal_api', error: e.message}; }
     })()
   `);
+
+  // internal_api가 0개 반환 시 DOM 스크래핑으로 자동 fallback
+  if (Object.keys(results?.metrics || {}).length === 0) {
+    // 1차: 라벨-값 쌍 기반 파싱 (정확)
+    try {
+      const pairs = await evaluate(DOM_LABEL_VALUE_SCRAPE);
+      if (pairs && typeof pairs === 'object') {
+        const lvMetrics = parseLabelValuePairs(pairs);
+        if (Object.keys(lvMetrics).length > 0) {
+          return { success: true, metric_count: Object.keys(lvMetrics).length, source: 'dom_label_value', metrics: lvMetrics };
+        }
+      }
+    } catch { /* fall through */ }
+    // 2차: 텍스트 노드 기반 파싱
+    try {
+      const raw = await evaluate(DOM_STRATEGY_SCRAPE);
+      const domMetrics = parseStrategyDom(raw || []);
+      if (Object.keys(domMetrics).length > 0) {
+        return { success: true, metric_count: Object.keys(domMetrics).length, source: 'dom_fallback', metrics: domMetrics };
+      }
+    } catch { /* DOM 스크래핑도 실패 시 원래 결과 반환 */ }
+  }
+
   return { success: true, metric_count: Object.keys(results?.metrics || {}).length, source: results?.source, metrics: results?.metrics || {}, error: results?.error };
 }
 

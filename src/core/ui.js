@@ -59,7 +59,7 @@ export async function openPanel({ panel, action }) {
     return { success: true, panel, action, was_open: result?.was_open ?? false, performed: result?.performed ?? 'unknown' };
   } else {
     const selectorMap = {
-      'watchlist': { dataName: 'base-watchlist-widget-button', ariaLabel: 'Watchlist' },
+      'watchlist': { dataName: 'base-watchlist-widget-button', ariaLabel: 'Watchlist, details, and news' },
       'alerts': { dataName: 'alerts-button', ariaLabel: 'Alerts' },
       'trading': { dataName: 'trading-button', ariaLabel: 'Trading Panel' },
     };

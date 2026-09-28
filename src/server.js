@@ -15,6 +15,16 @@ import { registerUiTools } from "./tools/ui.js";
 import { registerPaneTools } from "./tools/pane.js";
 import { registerTabTools } from "./tools/tab.js";
 import { registerKoreanTools } from "./tools/korean.js";
+import { registerStrategyTools } from "./tools/strategy.js";
+
+// Prevent unhandled rejections/exceptions from crashing the stdio MCP process.
+// Claude Code shows "Failed to reconnect: -32000" if the server exits unexpectedly.
+process.on('unhandledRejection', (reason) => {
+  process.stderr.write(`[tradingview-mcp] unhandledRejection: ${reason}\n`);
+});
+process.on('uncaughtException', (err) => {
+  process.stderr.write(`[tradingview-mcp] uncaughtException: ${err?.message ?? err}\n`);
+});
 
 const server = new McpServer(
   {
@@ -87,6 +97,7 @@ registerUiTools(server);
 registerPaneTools(server);
 registerTabTools(server);
 registerKoreanTools(server);
+registerStrategyTools(server);
 
 // Startup notice (stderr so it doesn't interfere with MCP stdio protocol)
 process.stderr.write(

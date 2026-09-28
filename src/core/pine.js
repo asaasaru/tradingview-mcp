@@ -287,9 +287,114 @@ export async function getSource() {
   return { success: true, source, line_count: source.split('\n').length, char_count: source.length };
 }
 
+const HISTORICAL_BANNER_CHECK = `
+  (function() {
+    var bodyText = document.body.innerText || '';
+    return /historical version of the script/i.test(bodyText);
+  })()
+`;
+
+// 이전 스크립트가 "historical version" (읽기 전용 과거 버전) 상태로 남아있으면
+// monaco.setValue()가 에디터 안의 텍스트는 바꾸지만, 헤더에 표시되는 스크립트
+// 자체(예: 완전히 다른 이름의 예전 저장 스크립트)는 그 historical 상태에 계속
+// 묶여있어 Add to chart가 새 코드를 반영하지 못하고 결과 미표시로 무한 반복되는
+// 문제가 실측 확인됨 (스크린샷: 헤더 제목이 방금 setValue()로 덮어쓴 코드와 무관한
+// 예전 저장 스크립트 이름 그대로였음). 키보드 단축키(Ctrl+K, Ctrl+S)로 새 빈 전략을
+// 로드해보려던 첫 시도는 modifier를 Ctrl로 보내 헤더가 전혀 바뀌지 않았음 — Mac
+// TradingView 데스크탑 앱에서는 Cmd(Meta)라고 사용자가 실측 확인. modifier는 고쳤지만
+// 검증되지 않은 단축키보다 신뢰도 높은 경로로 아래 restore-링크 클릭을 우선한다 —
+// 배너의 "restore this version" 링크를 직접 클릭하는, TradingView 자체가 제공하는
+// 공식 탈출 경로를 우선 사용한다 (구 Playwright 구현의
+// _handle_historical_version_banner와 동일한 접근, CLAUDE.md §22 참고).
+async function resetEditorToBlank() {
+  const c = await getClient();
+  const isMac = process.platform === 'darwin';
+  const modifiers = isMac ? 4 : 2; // Meta(Cmd)=4, Ctrl=2
+
+  await evaluate(`
+    (function() {
+      var m = ${FIND_MONACO};
+      if (m && m.editor) { try { m.editor.focus(); } catch(e) {} }
+    })()
+  `);
+  await new Promise(r => setTimeout(r, 150));
+
+  const hadBanner = await evaluate(HISTORICAL_BANNER_CHECK).catch(() => false);
+  if (hadBanner) {
+    const clicked = await evaluate(`
+      (function() {
+        var els = document.querySelectorAll('a, button, span, div');
+        for (var i = 0; i < els.length; i++) {
+          var t = (els[i].textContent || '').trim();
+          if (t && /^restore this version$/i.test(t)) {
+            els[i].click();
+            return true;
+          }
+        }
+        return false;
+      })()
+    `).catch(() => false);
+    let stillBlocked = true;
+    if (clicked) {
+      await new Promise(r => setTimeout(r, 1500));
+      stillBlocked = await evaluate(HISTORICAL_BANNER_CHECK).catch(() => true);
+      process.stderr.write(`[pine] historical banner 감지 → restore 링크 클릭 → ${stillBlocked ? '배너 그대로 남음' : '배너 해제됨'}\n`);
+    } else {
+      process.stderr.write('[pine] historical banner 감지했으나 "restore this version" 링크를 찾지 못함\n');
+    }
+
+    // restore 링크로 안 풀리면 최후 수단으로 새 빈 전략을 로드한다. 단, 이건 매번 새
+    // 스크립트 identity를 만들어서 "Add to chart"가 "Update on chart"로 이어지지 못하고
+    // 매 시도마다 인디케이터가 하나씩 더 쌓이는 부작용이 있음(실측: 25개 제한에 걸려
+    // TradingView가 업그레이드 유도 팝업을 띄우고 그 뒤로는 아무것도 안 먹힘) — 그래서
+    // banner가 없는 정상 재시도에서는 절대 타지 않고, banner가 있고 restore로도 안 풀릴
+    // 때만 예외적으로 쓴다.
+    if (stillBlocked) {
+      const chord = [
+        { key: 'k', code: 'KeyK', windowsVirtualKeyCode: 75 },
+        { key: 's', code: 'KeyS', windowsVirtualKeyCode: 83 },
+      ];
+      for (const k of chord) {
+        await c.Input.dispatchKeyEvent({ type: 'keyDown', modifiers, key: k.key, code: k.code, windowsVirtualKeyCode: k.windowsVirtualKeyCode });
+        await c.Input.dispatchKeyEvent({ type: 'keyUp', modifiers: 0, key: k.key, code: k.code, windowsVirtualKeyCode: k.windowsVirtualKeyCode });
+        await new Promise(r => setTimeout(r, 150));
+      }
+      await new Promise(r => setTimeout(r, 800));
+
+      const dismissedSaveDialog = await evaluate(`
+        (function() {
+          var btns = document.querySelectorAll('button');
+          for (var i = 0; i < btns.length; i++) {
+            var t = (btns[i].textContent || '').trim();
+            if (/^don't save$/i.test(t)) { btns[i].click(); return true; }
+          }
+          return false;
+        })()
+      `).catch(() => false);
+      if (dismissedSaveDialog) {
+        process.stderr.write('[pine] "Save script before switching?" 다이얼로그 감지 → Don\'t save 클릭\n');
+        await new Promise(r => setTimeout(r, 800));
+      }
+    }
+  }
+
+  await c.Input.dispatchKeyEvent({ type: 'keyDown', modifiers, key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65 });
+  await c.Input.dispatchKeyEvent({ type: 'keyUp', modifiers: 0, key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65 });
+  await new Promise(r => setTimeout(r, 150));
+  await c.Input.dispatchKeyEvent({ type: 'keyDown', modifiers: 0, key: 'Delete', code: 'Delete', windowsVirtualKeyCode: 46 });
+  await c.Input.dispatchKeyEvent({ type: 'keyUp', modifiers: 0, key: 'Delete', code: 'Delete', windowsVirtualKeyCode: 46 });
+  await new Promise(r => setTimeout(r, 300));
+}
+
 export async function setSource({ source }) {
   const editorReady = await ensurePineEditorOpen();
   if (!editorReady) throw new Error('Could not open Pine Editor.');
+
+  try {
+    await resetEditorToBlank();
+  } catch (e) {
+    process.stderr.write(`[pine] resetEditorToBlank 실패 (무시하고 setValue로 계속): ${e.message}\n`);
+  }
 
   const escaped = JSON.stringify(source);
   const set = await evaluate(`
@@ -327,25 +432,8 @@ async function clickCompileButton({ hasExistingStrategy = false } = {}) {
   const modifiers = isMac ? 4 : 2; // Meta(Cmd)=4, Ctrl=2
   const c = await getClient();
 
-  // 기존 전략이 차트에 있으면 Cmd+Enter = "Update on chart" (전략 쌓임 없음)
-  // 기존 전략 없으면 DOM [data-qa-id="add-script-to-chart"] 클릭 (Save 다이얼로그 없음)
-  if (hasExistingStrategy) {
-    // Cmd+A로 에디터 전체 선택 후 Cmd+Enter — Monaco 포커스 필수
-    await evaluate(`
-      (function() {
-        var m = ${FIND_MONACO};
-        if (m && m.editor) { try { m.editor.focus(); } catch(e) {} }
-      })()
-    `);
-    await new Promise(r => setTimeout(r, 150));
-    await c.Input.dispatchKeyEvent({ type: 'keyDown', modifiers, key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
-    await c.Input.dispatchKeyEvent({ type: 'keyUp', modifiers: 0, key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
-    await new Promise(r => setTimeout(r, 1000));
-    process.stderr.write('[Pine] Cmd+Enter (Update on chart) 전송\n');
-    return { label: isMac ? 'Cmd+Enter(update)' : 'Ctrl+Enter(update)', method: 'keyboard_update' };
-  }
-
-  // 1순위: DOM 버튼 직접 클릭 — Save 다이얼로그 없이 작동 (테스트 검증됨)
+  // DOM 버튼 직접 클릭 — Save/unsaved 다이얼로그 없이 작동 (테스트 검증됨)
+  // hasExistingStrategy=true 포함 항상 DOM 우선 — Cmd+Enter는 unsaved 다이얼로그 트리거함
   // [data-qa-id="add-script-to-chart"] 는 text가 없어도 visible하면 클릭 가능
   const FIND_COMPILE_BTN = `
     (function() {
@@ -556,7 +644,51 @@ export async function smartCompile() {
 
   const hasExisting = (studiesBefore !== null && studiesBefore > 0);
   const { label: buttonClicked, method: buttonMethod } = await clickCompileButton({ hasExistingStrategy: hasExisting });
-  await new Promise(r => setTimeout(r, 2500));
+  await new Promise(r => setTimeout(r, 1200));
+
+  // "Cannot add a script with unsaved changes" 다이얼로그
+  // → "Save and add to chart" 클릭 (저장 후 추가 — "No"는 작업 취소임)
+  const dialogDismissed = await evaluate(`
+    (function() {
+      var btns = Array.from(document.querySelectorAll('button')).filter(function(b) { return b.offsetParent; });
+      // 1순위: "Save and add to chart" / 한글 변형
+      var saveTexts = ["Save and add to chart","저장 후 차트에 추가","Save and add","저장하고 추가"];
+      for (var t of saveTexts) {
+        var btn = btns.find(function(b) { return b.textContent.trim().toLowerCase().includes(t.toLowerCase()); });
+        if (btn) { btn.click(); return 'save_and_add:' + btn.textContent.trim(); }
+      }
+      return null;
+    })()
+  `).catch(() => null);
+
+  if (dialogDismissed) {
+    process.stderr.write('[Pine] unsaved-changes dialog → save_and_add: ' + dialogDismissed + '\\n');
+    await new Promise(r => setTimeout(r, 800));
+    // "Save Script" 이름 입력 다이얼로그가 추가로 뜰 수 있음 → OK/저장 클릭
+    await evaluate(`
+      (function() {
+        var okTexts = ["Save","저장","OK","확인"];
+        var btns = Array.from(document.querySelectorAll('button')).filter(function(b) { return b.offsetParent; });
+        for (var t of okTexts) {
+          var btn = btns.find(function(b) {
+            var txt = b.textContent.trim();
+            return txt === t || txt.toLowerCase() === t.toLowerCase();
+          });
+          if (btn) { btn.click(); return t; }
+        }
+        // 입력 필드 있으면 Enter 키
+        var inp = document.querySelector('input[placeholder*="name"], input[placeholder*="이름"], dialog input, [role="dialog"] input');
+        if (inp && inp.offsetParent) {
+          inp.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', keyCode:13, bubbles:true}));
+          return 'enter_on_input';
+        }
+        return null;
+      })()
+    `).catch(() => null);
+    await new Promise(r => setTimeout(r, 1200));
+  } else {
+    await new Promise(r => setTimeout(r, 1300));
+  }
 
   const errors = await evaluate(`
     (function() {

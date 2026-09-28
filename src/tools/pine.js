@@ -1,6 +1,8 @@
 import { z } from 'zod';
 import { jsonResult } from './_format.js';
 import * as core from '../core/pine.js';
+import { startWatchdog, cancelWatchdog } from '../core/watchdog.js';
+import { sendTelegram } from '../core/notifier.js';
 
 export function registerPineTools(server) {
   server.tool('pine_get_source', 'Get current Pine Script source code from the editor', {}, async () => {
@@ -16,8 +18,24 @@ export function registerPineTools(server) {
   });
 
   server.tool('pine_compile', 'Compile / add the current Pine Script to the chart', {}, async () => {
-    try { return jsonResult(await core.compile()); }
-    catch (err) { return jsonResult({ success: false, error: err.message }, true); }
+    try {
+      cancelWatchdog();
+      return jsonResult(await core.compile());
+    } catch (err) {
+      if (err.name === 'CompileButtonNotFoundError') {
+        startWatchdog();
+        sendTelegram(
+          '⚠️ <b>[TradingView MCP]</b> 컴파일 버튼 탐색 실패\n\n' +
+          '3회 DOM 시도 + 키보드 단축키 모두 실패했습니다.\n\n' +
+          '다음 중 하나를 해주세요:\n' +
+          '  1. "Add to chart" 또는 "Update on chart" 버튼을 직접 클릭\n' +
+          '  2. 버튼에 표시된 정확한 텍스트를 알려주세요\n\n' +
+          '⏱ 5분 내 응답 없으면 TradingView 자동 종료됩니다.'
+        ).catch(() => {});
+        return jsonResult({ success: false, error: err.message, user_message: err.userMessage, action_required: true }, true);
+      }
+      return jsonResult({ success: false, error: err.message }, true);
+    }
   });
 
   server.tool('pine_get_errors', 'Get Pine Script compilation errors from Monaco markers', {}, async () => {
@@ -36,8 +54,24 @@ export function registerPineTools(server) {
   });
 
   server.tool('pine_smart_compile', 'Intelligent compile: detects button, compiles, checks errors, reports study changes', {}, async () => {
-    try { return jsonResult(await core.smartCompile()); }
-    catch (err) { return jsonResult({ success: false, error: err.message }, true); }
+    try {
+      cancelWatchdog();
+      return jsonResult(await core.smartCompile());
+    } catch (err) {
+      if (err.name === 'CompileButtonNotFoundError') {
+        startWatchdog();
+        sendTelegram(
+          '⚠️ <b>[TradingView MCP]</b> 컴파일 버튼 탐색 실패\n\n' +
+          '3회 DOM 시도 + 키보드 단축키 모두 실패했습니다.\n\n' +
+          '다음 중 하나를 해주세요:\n' +
+          '  1. "Add to chart" 또는 "Update on chart" 버튼을 직접 클릭\n' +
+          '  2. 버튼에 표시된 정확한 텍스트를 알려주세요\n\n' +
+          '⏱ 5분 내 응답 없으면 TradingView 자동 종료됩니다.'
+        ).catch(() => {});
+        return jsonResult({ success: false, error: err.message, user_message: err.userMessage, action_required: true }, true);
+      }
+      return jsonResult({ success: false, error: err.message }, true);
+    }
   });
 
   server.tool('pine_new', 'Create a new blank Pine Script', {
