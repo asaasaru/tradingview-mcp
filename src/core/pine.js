@@ -287,126 +287,218 @@ export async function getSource() {
   return { success: true, source, line_count: source.split('\n').length, char_count: source.length };
 }
 
+export const HISTORICAL_BANNER_REGEX = /historical\s+version\s+(?:cannot|can['’]?t)\s+be\s+published|to\s+edit\s+its\s+code\s*,?\s*restore\s+this\s+version|historical\s+version\s+of\s+the\s+script/i;
+
 const HISTORICAL_BANNER_CHECK = `
   (function() {
-    var bodyText = document.body.innerText || '';
-    return /historical version of the script/i.test(bodyText);
+    var bodyText = (document.body && (document.body.innerText || document.body.textContent)) || '';
+    return new RegExp(${JSON.stringify(HISTORICAL_BANNER_REGEX.source)}, 'i').test(bodyText);
   })()
 `;
 
-// 이전 스크립트가 "historical version" (읽기 전용 과거 버전) 상태로 남아있으면
-// monaco.setValue()가 에디터 안의 텍스트는 바꾸지만, 헤더에 표시되는 스크립트
-// 자체(예: 완전히 다른 이름의 예전 저장 스크립트)는 그 historical 상태에 계속
-// 묶여있어 Add to chart가 새 코드를 반영하지 못하고 결과 미표시로 무한 반복되는
-// 문제가 실측 확인됨 (스크린샷: 헤더 제목이 방금 setValue()로 덮어쓴 코드와 무관한
-// 예전 저장 스크립트 이름 그대로였음). 키보드 단축키(Ctrl+K, Ctrl+S)로 새 빈 전략을
-// 로드해보려던 첫 시도는 modifier를 Ctrl로 보내 헤더가 전혀 바뀌지 않았음 — Mac
-// TradingView 데스크탑 앱에서는 Cmd(Meta)라고 사용자가 실측 확인. modifier는 고쳤지만
-// 검증되지 않은 단축키보다 신뢰도 높은 경로로 아래 restore-링크 클릭을 우선한다 —
-// 배너의 "restore this version" 링크를 직접 클릭하는, TradingView 자체가 제공하는
-// 공식 탈출 경로를 우선 사용한다 (구 Playwright 구현의
-// _handle_historical_version_banner와 동일한 접근, CLAUDE.md §22 참고).
-async function resetEditorToBlank() {
-  const c = await getClient();
-  const isMac = process.platform === 'darwin';
-  const modifiers = isMac ? 4 : 2; // Meta(Cmd)=4, Ctrl=2
-
-  await evaluate(`
+export async function getEditorStatus() {
+  return await evaluate(`
     (function() {
+      var bodyText = (document.body && (document.body.innerText || document.body.textContent)) || '';
+      var hasBanner = new RegExp(${JSON.stringify(HISTORICAL_BANNER_REGEX.source)}, 'i').test(bodyText);
       var m = ${FIND_MONACO};
-      if (m && m.editor) { try { m.editor.focus(); } catch(e) {} }
+      var monacoReady = !!(m && m.editor);
+      var readOnly = false;
+      if (monacoReady) {
+        var opt = (m.env && m.env.editor && m.env.editor.EditorOption && typeof m.env.editor.EditorOption.readOnly === 'number')
+          ? m.env.editor.EditorOption.readOnly
+          : 91;
+        if (typeof m.editor.getOption === 'function') {
+          readOnly = !!m.editor.getOption(opt);
+        } else if (typeof m.editor.getRawOptions === 'function') {
+          var raw = m.editor.getRawOptions();
+          readOnly = !!(raw && raw.readOnly);
+        } else {
+          readOnly = true;
+        }
+      }
+      return {
+        hasBanner: hasBanner,
+        monacoReady: monacoReady,
+        readOnly: readOnly,
+        isBlocked: hasBanner || readOnly
+      };
     })()
   `);
+}
+
+async function triggerCreateNewStrategyMenu() {
+  const opened = await evaluate(`
+    (function() {
+      var btn = document.querySelector('[data-qa-id="pine-script-title-button"]')
+        || document.querySelector('[data-name="pine-script-title-button"]');
+      if (btn) {
+        btn.click();
+        return true;
+      }
+      return false;
+    })()
+  `);
+  if (!opened) return { success: false, reason: 'pine-script-title-button not found' };
+
   await new Promise(r => setTimeout(r, 150));
 
-  const hadBanner = await evaluate(HISTORICAL_BANNER_CHECK).catch(() => false);
-  if (hadBanner) {
-    const clicked = await evaluate(`
+  let subOpened = false;
+  for (let i = 0; i < 10; i++) {
+    subOpened = await evaluate(`
       (function() {
-        var els = document.querySelectorAll('a, button, span, div');
-        for (var i = 0; i < els.length; i++) {
-          var t = (els[i].textContent || '').trim();
-          if (t && /^restore this version$/i.test(t)) {
-            els[i].click();
+        var items = document.querySelectorAll('[role="menuitem"]');
+        for (var i = 0; i < items.length; i++) {
+          var item = items[i];
+          var role = (typeof item.getAttribute === 'function') ? item.getAttribute('role') : item.role;
+          if (role !== 'menuitem') continue;
+          var t = (item.textContent || '').trim().replace(/\\s+/g, ' ');
+          if (/^create new(?:\\s*(?:\\.{3}|…|[>›▶]))?$/i.test(t)) {
+            if (typeof MouseEvent !== 'undefined') {
+              item.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, cancelable: true, view: window }));
+              item.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true, cancelable: true, view: window }));
+            }
+            item.click();
             return true;
           }
         }
         return false;
       })()
-    `).catch(() => false);
-    let stillBlocked = true;
-    if (clicked) {
-      await new Promise(r => setTimeout(r, 1500));
-      stillBlocked = await evaluate(HISTORICAL_BANNER_CHECK).catch(() => true);
-      process.stderr.write(`[pine] historical banner 감지 → restore 링크 클릭 → ${stillBlocked ? '배너 그대로 남음' : '배너 해제됨'}\n`);
-    } else {
-      process.stderr.write('[pine] historical banner 감지했으나 "restore this version" 링크를 찾지 못함\n');
-    }
+    `);
+    if (subOpened) break;
+    await new Promise(r => setTimeout(r, 100));
+  }
+  if (!subOpened) return { success: false, reason: 'Create new menu item not found' };
 
-    // restore 링크로 안 풀리면 최후 수단으로 새 빈 전략을 로드한다. 단, 이건 매번 새
-    // 스크립트 identity를 만들어서 "Add to chart"가 "Update on chart"로 이어지지 못하고
-    // 매 시도마다 인디케이터가 하나씩 더 쌓이는 부작용이 있음(실측: 25개 제한에 걸려
-    // TradingView가 업그레이드 유도 팝업을 띄우고 그 뒤로는 아무것도 안 먹힘) — 그래서
-    // banner가 없는 정상 재시도에서는 절대 타지 않고, banner가 있고 restore로도 안 풀릴
-    // 때만 예외적으로 쓴다.
-    if (stillBlocked) {
-      const chord = [
-        { key: 'k', code: 'KeyK', windowsVirtualKeyCode: 75 },
-        { key: 's', code: 'KeyS', windowsVirtualKeyCode: 83 },
-      ];
-      for (const k of chord) {
-        await c.Input.dispatchKeyEvent({ type: 'keyDown', modifiers, key: k.key, code: k.code, windowsVirtualKeyCode: k.windowsVirtualKeyCode });
-        await c.Input.dispatchKeyEvent({ type: 'keyUp', modifiers: 0, key: k.key, code: k.code, windowsVirtualKeyCode: k.windowsVirtualKeyCode });
-        await new Promise(r => setTimeout(r, 150));
-      }
-      await new Promise(r => setTimeout(r, 800));
+  await new Promise(r => setTimeout(r, 150));
 
-      const dismissedSaveDialog = await evaluate(`
-        (function() {
-          var btns = document.querySelectorAll('button');
-          for (var i = 0; i < btns.length; i++) {
-            var t = (btns[i].textContent || '').trim();
-            if (/^don't save$/i.test(t)) { btns[i].click(); return true; }
+  let strategyClicked = false;
+  for (let i = 0; i < 10; i++) {
+    strategyClicked = await evaluate(`
+      (function() {
+        var items = document.querySelectorAll('[role="menuitem"]');
+        for (var i = 0; i < items.length; i++) {
+          var item = items[i];
+          var role = (typeof item.getAttribute === 'function') ? item.getAttribute('role') : item.role;
+          if (role !== 'menuitem') continue;
+          var t = (item.textContent || '').trim().replace(/\\s+/g, ' ');
+          if (/^strategy(?:\\s*(?:[⌘\\^⌃⌥⇧]|Ctrl|Cmd|Alt|Shift).*|)$/i.test(t)) {
+            item.click();
+            return true;
           }
-          return false;
-        })()
-      `).catch(() => false);
-      if (dismissedSaveDialog) {
-        process.stderr.write('[pine] "Save script before switching?" 다이얼로그 감지 → Don\'t save 클릭\n');
-        await new Promise(r => setTimeout(r, 800));
-      }
+        }
+        return false;
+      })()
+    `);
+    if (strategyClicked) break;
+    await new Promise(r => setTimeout(r, 100));
+  }
+  if (!strategyClicked) return { success: false, reason: 'Strategy submenu item not found' };
+
+  return { success: true };
+}
+
+async function waitForEditableEditor(timeoutMs = 5000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const status = await getEditorStatus().catch(() => null);
+    if (status && !status.hasBanner && status.monacoReady && !status.readOnly) {
+      return { success: true, status };
     }
+    await new Promise(r => setTimeout(r, 100));
+  }
+  const finalStatus = await getEditorStatus().catch(() => null);
+  return {
+    success: !!(finalStatus && !finalStatus.hasBanner && finalStatus.monacoReady && !finalStatus.readOnly),
+    status: finalStatus
+  };
+}
+
+export async function resetEditorToBlank() {
+  const status = await getEditorStatus();
+  if (!status || !status.isBlocked) {
+    return { recovered: false, wasBlocked: false };
   }
 
-  await c.Input.dispatchKeyEvent({ type: 'keyDown', modifiers, key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65 });
-  await c.Input.dispatchKeyEvent({ type: 'keyUp', modifiers: 0, key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65 });
-  await new Promise(r => setTimeout(r, 150));
-  await c.Input.dispatchKeyEvent({ type: 'keyDown', modifiers: 0, key: 'Delete', code: 'Delete', windowsVirtualKeyCode: 46 });
-  await c.Input.dispatchKeyEvent({ type: 'keyUp', modifiers: 0, key: 'Delete', code: 'Delete', windowsVirtualKeyCode: 46 });
-  await new Promise(r => setTimeout(r, 300));
+  process.stderr.write(`[pine] Historical/read-only 상태 감지 (banner: ${status.hasBanner}, readOnly: ${status.readOnly}) → UI 메뉴로 새 unsaved Strategy 생성\n`);
+
+  const menuResult = await triggerCreateNewStrategyMenu();
+  if (!menuResult.success) {
+    throw new Error(`Failed to create fresh strategy via menu: ${menuResult.reason}`);
+  }
+
+  const waitResult = await waitForEditableEditor(5000);
+  if (!waitResult.success) {
+    throw new Error(`Editor remained read-only or historical after recovery: banner=${waitResult.status?.hasBanner}, readOnly=${waitResult.status?.readOnly}, monacoReady=${waitResult.status?.monacoReady}`);
+  }
+
+  process.stderr.write('[pine] Fresh editable unsaved Strategy 생성 및 편집 가능 확인 완료\n');
+  return { recovered: true, wasBlocked: true };
 }
 
 export async function setSource({ source }) {
   const editorReady = await ensurePineEditorOpen();
   if (!editorReady) throw new Error('Could not open Pine Editor.');
 
-  try {
-    await resetEditorToBlank();
-  } catch (e) {
-    process.stderr.write(`[pine] resetEditorToBlank 실패 (무시하고 setValue로 계속): ${e.message}\n`);
-  }
+  // Do not ignore reset exceptions in setSource; error must stop injection.
+  await resetEditorToBlank();
 
+  // Do not Ctrl+A/Delete before setValue: setValue itself full replacement.
   const escaped = JSON.stringify(source);
-  const set = await evaluate(`
+  const writeResult = await evaluate(`
     (function() {
       var m = ${FIND_MONACO};
-      if (!m) return false;
+      if (!m || !m.editor) return { ok: false, error: 'Monaco editor not found.' };
+
+      var opt = (m.env && m.env.editor && m.env.editor.EditorOption && typeof m.env.editor.EditorOption.readOnly === 'number')
+        ? m.env.editor.EditorOption.readOnly
+        : 91;
+      var ro = false;
+      if (typeof m.editor.getOption === 'function') {
+        ro = !!m.editor.getOption(opt);
+      } else if (typeof m.editor.getRawOptions === 'function') {
+        var raw = m.editor.getRawOptions();
+        ro = !!(raw && raw.readOnly);
+      } else {
+        ro = true;
+      }
+      if (ro) return { ok: false, error: 'Editor is read-only before setValue.' };
+
       m.editor.setValue(${escaped});
-      return true;
+
+      var val = typeof m.editor.getValue === 'function' ? m.editor.getValue() : null;
+      var roAfter = false;
+      if (typeof m.editor.getOption === 'function') {
+        roAfter = !!m.editor.getOption(opt);
+      } else if (typeof m.editor.getRawOptions === 'function') {
+        var rawAfter = m.editor.getRawOptions();
+        roAfter = !!(rawAfter && rawAfter.readOnly);
+      } else {
+        roAfter = true;
+      }
+
+      return {
+        ok: true,
+        actual: val,
+        readOnlyAfter: roAfter
+      };
     })()
   `);
 
-  if (!set) throw new Error('Monaco found but setValue() failed.');
+  if (!writeResult || !writeResult.ok) {
+    throw new Error(writeResult?.error || 'Monaco found but setValue() failed.');
+  }
+
+  if (writeResult.readOnlyAfter) {
+    throw new Error('Editor is read-only after write.');
+  }
+
+  // Verify injected source exact (normalize CRLF only) and writable after write; fail on mismatch.
+  const normalize = (s) => (s ?? '').replace(/\r\n/g, '\n');
+  if (normalize(writeResult.actual) !== normalize(source)) {
+    throw new Error(`Injected source mismatch: expected ${source.length} chars, got ${writeResult.actual?.length ?? 0} chars.`);
+  }
+
   return { success: true, lines_set: source.split('\n').length };
 }
 
@@ -662,7 +754,7 @@ export async function smartCompile() {
   `).catch(() => null);
 
   if (dialogDismissed) {
-    process.stderr.write('[Pine] unsaved-changes dialog → save_and_add: ' + dialogDismissed + '\\n');
+    process.stderr.write('[Pine] unsaved-changes dialog → save_and_add: ' + dialogDismissed + '\n');
     await new Promise(r => setTimeout(r, 800));
     // "Save Script" 이름 입력 다이얼로그가 추가로 뜰 수 있음 → OK/저장 클릭
     await evaluate(`

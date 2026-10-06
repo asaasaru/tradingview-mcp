@@ -229,45 +229,144 @@ function parseLabelValuePairs(pairs) {
   return metrics;
 }
 
+export function normalizeStrategyMetrics(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return {};
+  }
+
+  let root = raw;
+  if (root.reportData && typeof root.reportData === 'object' && !Array.isArray(root.reportData)) {
+    root = root.reportData;
+  }
+
+  const perf = (root.performance && typeof root.performance === 'object' && !Array.isArray(root.performance))
+    ? root.performance
+    : null;
+
+  const all = (perf?.all && typeof perf.all === 'object' && !Array.isArray(perf.all))
+    ? perf.all
+    : (root.all && typeof root.all === 'object' && !Array.isArray(root.all))
+      ? root.all
+      : null;
+
+  const result = {};
+
+  const findFirstFinite = (...candidates) => {
+    for (const c of candidates) {
+      if (typeof c === 'number' && Number.isFinite(c)) return c;
+    }
+    return undefined;
+  };
+
+  const toPercent = (v) => {
+    const val = Math.round(v * 100 * 1e8) / 1e8;
+    return val === 0 ? 0 : val;
+  };
+
+  const netProfit = findFirstFinite(root.net_profit, all?.netProfit, perf?.netProfit, root.netProfit, all?.net_profit);
+  if (netProfit !== undefined) result.net_profit = netProfit;
+
+  const canonicalNetProfitPct = findFirstFinite(root.net_profit_pct);
+  const rawNetProfitPct = findFirstFinite(all?.netProfitPercent, perf?.netProfitPercent);
+  const directNetProfitPct = findFirstFinite(root.netProfitPercent, root.netProfitPct, all?.net_profit_pct);
+
+  if (canonicalNetProfitPct !== undefined) {
+    result.net_profit_pct = canonicalNetProfitPct;
+  } else if (rawNetProfitPct !== undefined) {
+    result.net_profit_pct = toPercent(rawNetProfitPct);
+  } else if (directNetProfitPct !== undefined) {
+    result.net_profit_pct = directNetProfitPct;
+  }
+
+  const totalTrades = findFirstFinite(root.total_closed_trades, all?.totalTrades, perf?.totalTrades, root.totalTrades, all?.total_closed_trades, root.total_trades);
+  if (totalTrades !== undefined) result.total_closed_trades = totalTrades;
+
+  const percentProfitable = findFirstFinite(all?.percentProfitable, perf?.percentProfitable, root.percentProfitable);
+  if (percentProfitable !== undefined) {
+    result.win_rate = toPercent(percentProfitable);
+  } else {
+    const directWinRate = findFirstFinite(root.win_rate, root.winRate, all?.win_rate, all?.winRate, perf?.win_rate, perf?.winRate);
+    if (directWinRate !== undefined) result.win_rate = directWinRate;
+  }
+
+  const profitFactor = findFirstFinite(root.profit_factor, all?.profitFactor, perf?.profitFactor, root.profitFactor, all?.profit_factor);
+  if (profitFactor !== undefined) result.profit_factor = profitFactor;
+
+  const canonicalMaxDrawdown = findFirstFinite(root.max_drawdown);
+  const rawMaxDrawdown = findFirstFinite(
+    perf?.maxStrategyDrawDownPercent,
+    perf?.maxStrategyDrawdownPercent,
+    perf?.maxDrawdownPercent,
+    all?.maxStrategyDrawDownPercent,
+    all?.maxStrategyDrawdownPercent,
+    all?.maxDrawdownPercent
+  );
+  const directMaxDrawdown = findFirstFinite(
+    root.maxStrategyDrawDownPercent,
+    root.maxStrategyDrawdownPercent,
+    root.maxDrawdownPercent,
+    perf?.max_drawdown,
+    all?.max_drawdown
+  );
+
+  if (canonicalMaxDrawdown !== undefined) {
+    result.max_drawdown = canonicalMaxDrawdown;
+  } else if (rawMaxDrawdown !== undefined) {
+    result.max_drawdown = toPercent(rawMaxDrawdown);
+  } else if (directMaxDrawdown !== undefined) {
+    result.max_drawdown = directMaxDrawdown;
+  }
+
+  return result;
+}
+
 export async function getStrategyResults() {
-  const results = await evaluate(`
-    (function() {
-      try {
-        var chart = ${CHART_API}._chartWidget;
-        var sources = chart.model().model().dataSources();
-        var strat = null;
-        for (var i = 0; i < sources.length; i++) {
-          var s = sources[i];
-          if (s.metaInfo && s.metaInfo().is_price_study === false && (s.reportData || s.performance)) { strat = s; break; }
-        }
-        if (!strat) return {metrics: {}, source: 'internal_api', error: 'No strategy found on chart. Add a strategy indicator first.'};
-        var metrics = {};
-        if (strat.reportData) {
-          var rd = typeof strat.reportData === 'function' ? strat.reportData() : strat.reportData;
-          if (rd && typeof rd === 'object') {
-            if (typeof rd.value === 'function') rd = rd.value();
-            if (rd) { var keys = Object.keys(rd); for (var k = 0; k < keys.length; k++) { var val = rd[keys[k]]; if (val !== null && val !== undefined && typeof val !== 'function') metrics[keys[k]] = val; } }
+  let results;
+  try {
+    results = await evaluate(`
+      (function() {
+        try {
+          var chart = ${CHART_API}._chartWidget;
+          var sources = chart.model().model().dataSources();
+          var strat = null;
+          for (var i = 0; i < sources.length; i++) {
+            var s = sources[i];
+            if (s.metaInfo && s.metaInfo().isTVScriptStrategy === true && (s.reportData || s.performance)) { strat = s; break; }
           }
-        }
-        if (Object.keys(metrics).length === 0 && strat.performance) {
-          var perf = strat.performance();
-          if (perf && typeof perf.value === 'function') perf = perf.value();
-          if (perf && typeof perf === 'object') { var pkeys = Object.keys(perf); for (var p = 0; p < pkeys.length; p++) { var pval = perf[pkeys[p]]; if (pval !== null && pval !== undefined && typeof pval !== 'function') metrics[pkeys[p]] = pval; } }
-        }
-        return {metrics: metrics, source: 'internal_api'};
-      } catch(e) { return {metrics: {}, source: 'internal_api', error: e.message}; }
-    })()
-  `);
+          if (!strat) return {metrics: {}, source: 'internal_api', error: 'No strategy found on chart. Add a strategy indicator first.'};
+          var metrics = {};
+          if (strat.reportData) {
+            var rd = typeof strat.reportData === 'function' ? strat.reportData() : strat.reportData;
+            if (rd && typeof rd === 'object') {
+              if (typeof rd.value === 'function') rd = rd.value();
+              if (rd) { var keys = Object.keys(rd); for (var k = 0; k < keys.length; k++) { var val = rd[keys[k]]; if (val !== null && val !== undefined && typeof val !== 'function') metrics[keys[k]] = val; } }
+            }
+          }
+          if (Object.keys(metrics).length === 0 && strat.performance) {
+            var perf = strat.performance();
+            if (perf && typeof perf.value === 'function') perf = perf.value();
+            if (perf && typeof perf === 'object') { var pkeys = Object.keys(perf); for (var p = 0; p < pkeys.length; p++) { var pval = perf[pkeys[p]]; if (pval !== null && pval !== undefined && typeof pval !== 'function') metrics[pkeys[p]] = pval; } }
+          }
+          return {metrics: metrics, source: 'internal_api'};
+        } catch(e) { return {metrics: {}, source: 'internal_api', error: e.message}; }
+      })()
+    `);
+  } catch (err) {
+    results = { metrics: {}, source: 'internal_api', error: err?.message || 'Failed to evaluate strategy results.' };
+  }
+
+  let metrics = normalizeStrategyMetrics(results?.metrics);
 
   // internal_api가 0개 반환 시 DOM 스크래핑으로 자동 fallback
-  if (Object.keys(results?.metrics || {}).length === 0) {
+  if (Object.keys(metrics).length === 0) {
     // 1차: 라벨-값 쌍 기반 파싱 (정확)
     try {
       const pairs = await evaluate(DOM_LABEL_VALUE_SCRAPE);
       if (pairs && typeof pairs === 'object') {
         const lvMetrics = parseLabelValuePairs(pairs);
-        if (Object.keys(lvMetrics).length > 0) {
-          return { success: true, metric_count: Object.keys(lvMetrics).length, source: 'dom_label_value', metrics: lvMetrics };
+        const normLv = normalizeStrategyMetrics(lvMetrics);
+        if (Object.keys(normLv).length > 0) {
+          return { success: true, metric_count: Object.keys(normLv).length, source: 'dom_label_value', metrics: normLv };
         }
       }
     } catch { /* fall through */ }
@@ -275,13 +374,25 @@ export async function getStrategyResults() {
     try {
       const raw = await evaluate(DOM_STRATEGY_SCRAPE);
       const domMetrics = parseStrategyDom(raw || []);
-      if (Object.keys(domMetrics).length > 0) {
-        return { success: true, metric_count: Object.keys(domMetrics).length, source: 'dom_fallback', metrics: domMetrics };
+      const normDom = normalizeStrategyMetrics(domMetrics);
+      if (Object.keys(normDom).length > 0) {
+        return { success: true, metric_count: Object.keys(normDom).length, source: 'dom_fallback', metrics: normDom };
       }
     } catch { /* DOM 스크래핑도 실패 시 원래 결과 반환 */ }
   }
 
-  return { success: true, metric_count: Object.keys(results?.metrics || {}).length, source: results?.source, metrics: results?.metrics || {}, error: results?.error };
+  const metricCount = Object.keys(metrics).length;
+  if (metricCount === 0) {
+    return {
+      success: false,
+      metric_count: 0,
+      source: results?.source || 'internal_api',
+      metrics: {},
+      error: results?.error || 'No strategy metrics found.'
+    };
+  }
+
+  return { success: true, metric_count: metricCount, source: results?.source, metrics, error: results?.error };
 }
 
 export async function getTrades({ max_trades } = {}) {
@@ -294,7 +405,7 @@ export async function getTrades({ max_trades } = {}) {
         var strat = null;
         for (var i = 0; i < sources.length; i++) {
           var s = sources[i];
-          if (s.metaInfo && s.metaInfo().is_price_study === false && (s.ordersData || s.reportData)) { strat = s; break; }
+          if (s.metaInfo && s.metaInfo().isTVScriptStrategy === true && (s.ordersData || s.reportData || s.performance)) { strat = s; break; }
         }
         if (!strat) return {trades: [], source: 'internal_api', error: 'No strategy found on chart.'};
         var orders = null;
@@ -330,7 +441,7 @@ export async function getEquity() {
         var strat = null;
         for (var i = 0; i < sources.length; i++) {
           var s = sources[i];
-          if (s.metaInfo && s.metaInfo().is_price_study === false && (s.reportData || s.performance)) { strat = s; break; }
+          if (s.metaInfo && s.metaInfo().isTVScriptStrategy === true && (s.reportData || s.performance)) { strat = s; break; }
         }
         if (!strat) return {data: [], source: 'internal_api', error: 'No strategy found on chart.'};
         var data = [];

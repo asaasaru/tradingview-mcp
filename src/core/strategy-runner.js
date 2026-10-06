@@ -3,7 +3,7 @@ import { evaluate, getClient } from '../connection.js';
 import { setSource, smartCompile } from './pine.js';
 import { getStrategyResults } from './data.js';
 import { openPanel } from './ui.js';
-import { cancelWatchdog, startWatchdog } from './watchdog.js';
+import { cancelWatchdog } from './watchdog.js';
 
 export async function runStrategy({ source }) {
   cancelWatchdog();
@@ -22,7 +22,6 @@ export async function runStrategy({ source }) {
   try {
     compileResult = await smartCompile();
   } catch (uiErr) {
-    startWatchdog();
     return { success: false, error: uiErr.message, action_required: true, user_message: uiErr.userMessage };
   }
 
@@ -33,6 +32,19 @@ export async function runStrategy({ source }) {
       errors: compileResult.errors,
       has_errors: true,
       action_required: false,
+    };
+  }
+
+  if (compileResult?.study_added === false) {
+    return {
+      success: false,
+      error: 'Script not added to chart',
+      compile: {
+        button_clicked: compileResult.button_clicked,
+        method: compileResult.method,
+        has_errors: false,
+        study_added: false,
+      },
     };
   }
 
@@ -101,15 +113,20 @@ export async function runStrategy({ source }) {
   // Step 6: Pine Editor 복귀
   try { await openPanel({ panel: 'pine-editor', action: 'open' }); } catch {}
 
+  const metricCount = resultsResult?.metric_count || 0;
+  const isSuccess = resultsResult?.success !== false && metricCount > 0;
+
   cancelWatchdog();
   return {
-    success: true,
+    success: isSuccess,
+    ...(isSuccess ? {} : { error: 'no_metrics' }),
     compile: {
-      button_clicked: compileResult.button_clicked,
-      method: compileResult.method,
+      button_clicked: compileResult?.button_clicked,
+      method: compileResult?.method,
       has_errors: false,
+      study_added: compileResult?.study_added !== undefined ? compileResult.study_added : null,
     },
-    metric_count: resultsResult?.metric_count || 0,
+    metric_count: metricCount,
     source: resultsResult?.source,
     metrics: resultsResult?.metrics,
     blocking_state: blockingState,

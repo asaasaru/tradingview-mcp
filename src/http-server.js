@@ -176,11 +176,14 @@ const httpServer = http.createServer(async (req, res) => {
   }
 
   if (req.method === 'GET' && pathname === '/health') {
+    const rawCdp = parseInt(process.env.TV_CDP_PORT, 10);
+    const cdpPort = (!isNaN(rawCdp) && rawCdp >= 1 && rawCdp <= 65535) ? rawCdp : 9229;
     return json(res, 200, {
       status: 'ok',
       server: 'tradingview-mcp-http',
       host: HOST,
       port: PORT,
+      cdp_port: cdpPort,
       auth_required: Boolean(TOKEN),
       allowed_tools: allowedTools.size ? Array.from(allowedTools) : 'all',
       tool_count: Object.keys(getToolHandlers()).length,
