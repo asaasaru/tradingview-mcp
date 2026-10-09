@@ -31,32 +31,59 @@ export async function click({ by, value }) {
 export async function openPanel({ panel, action }) {
   const isBottomPanel = panel === 'pine-editor' || panel === 'strategy-tester';
   if (isBottomPanel) {
-    const widgetName = panel === 'pine-editor' ? 'pine-editor' : 'backtesting';
+    // Current TradingView widget registry: scripteditor and backtesting.
+    const widgetName = panel === 'pine-editor' ? 'scripteditor' : 'backtesting';
     const result = await evaluate(`
       (function() {
         var bwb = window.TradingView && window.TradingView.bottomWidgetBar;
         if (!bwb) return { error: 'bottomWidgetBar not available' };
-        var panel = ${JSON.stringify(panel)};
-        var widgetName = ${JSON.stringify(widgetName)};
+        var registered = !!(bwb._widgetControllers && bwb._widgetControllers.has(${JSON.stringify(widgetName)}));
+        if (!registered) return { error: 'Widget not registered: ' + ${JSON.stringify(widgetName)} };
+        var isOpen = typeof bwb.activeWidgetName === 'function'
+          && bwb.activeWidgetName() === ${JSON.stringify(widgetName)};
         var action = ${JSON.stringify(action)};
-        var bottomArea = document.querySelector('[class*="layout__area--bottom"]');
-        var isOpen = !!(bottomArea && bottomArea.offsetHeight > 50);
-        if (panel === 'pine-editor') { var monacoEl = document.querySelector('.monaco-editor.pine-editor-monaco'); isOpen = isOpen && !!monacoEl; }
-        if (panel === 'strategy-tester') { var stratPanel = document.querySelector('[data-name="backtesting"]') || document.querySelector('[class*="strategyReport"]'); isOpen = isOpen && !!(stratPanel && stratPanel.offsetParent); }
         var performed = 'none';
-        if (action === 'open' || (action === 'toggle' && !isOpen)) {
-          if (panel === 'pine-editor') { if (typeof bwb.activateScriptEditorTab === 'function') bwb.activateScriptEditorTab(); else if (typeof bwb.showWidget === 'function') bwb.showWidget(widgetName); }
-          else { if (typeof bwb.showWidget === 'function') bwb.showWidget(widgetName); }
+        if ((action === 'open' || action === 'toggle') && !isOpen) {
+          if (typeof bwb.showWidget !== 'function') return { error: 'showWidget unavailable' };
+          bwb.showWidget(${JSON.stringify(widgetName)});
           performed = 'opened';
-        } else if (action === 'close' || (action === 'toggle' && isOpen)) {
-          if (typeof bwb.hideWidget === 'function') bwb.hideWidget(widgetName);
+        } else if ((action === 'close' || action === 'toggle') && isOpen) {
+          if (typeof bwb.toggleWidget !== 'function') return { error: 'toggleWidget unavailable' };
+          bwb.toggleWidget(${JSON.stringify(widgetName)});
           performed = 'closed';
+        } else {
+          performed = isOpen ? 'already_open' : 'already_closed';
         }
         return { was_open: isOpen, performed: performed };
       })()
     `);
     if (result && result.error) throw new Error(result.error);
-    return { success: true, panel, action, was_open: result?.was_open ?? false, performed: result?.performed ?? 'unknown' };
+    const expectOpen = action === 'open' || (action === 'toggle' && !result?.was_open);
+    for (let attempt = 0; attempt < 25; attempt++) {
+      const verified = await evaluate(`
+        (function() {
+          var bwb = window.TradingView && window.TradingView.bottomWidgetBar;
+          var current = bwb && typeof bwb.activeWidgetName === 'function'
+            ? bwb.activeWidgetName() : null;
+          var bottom = document.querySelector('[class*="layout__area--bottom"]');
+          var rendered = !!(bottom && bottom.getBoundingClientRect().height > 50);
+          var monaco = !!document.querySelector('.monaco-editor');
+          var active = current === ${JSON.stringify(widgetName)};
+          return { open: active && rendered
+            && (${JSON.stringify(panel)} !== 'pine-editor' || monaco) };
+        })()
+      `);
+      if (!!verified?.open === expectOpen) {
+        return {
+          success: true, panel, action,
+          was_open: result?.was_open ?? false,
+          performed: result?.performed ?? 'unknown',
+          verified_open: !!verified?.open
+        };
+      }
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+    throw new Error('TradingView panel did not reach requested state: ' + panel);
   } else {
     const selectorMap = {
       'watchlist': { dataName: 'base-watchlist-widget-button', ariaLabel: 'Watchlist, details, and news' },

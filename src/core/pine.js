@@ -72,20 +72,28 @@ export async function ensurePineEditorOpen() {
     await new Promise(r => setTimeout(r, 1000));
   }
 
+  // Desktop TradingView registers the editor as 'scripteditor', not
+  // 'pine-editor'. Never blindly click the button after showWidget:
+  // the second toggle would immediately close the editor.
   await evaluate(`
     (function() {
       var bwb = window.TradingView && window.TradingView.bottomWidgetBar;
-      if (!bwb) return;
-      if (typeof bwb.activateScriptEditorTab === 'function') bwb.activateScriptEditorTab();
-      else if (typeof bwb.showWidget === 'function') bwb.showWidget('pine-editor');
-    })()
-  `);
-
-  await evaluate(`
-    (function() {
-      var btn = document.querySelector('[aria-label="Pine"]')
-        || document.querySelector('[data-name="pine-dialog-button"]');
-      if (btn) btn.click();
+      if (bwb && typeof bwb.showWidget === 'function'
+          && bwb._widgetControllers && bwb._widgetControllers.has('scripteditor')) {
+        bwb.showWidget('scripteditor');
+        return true;
+      }
+      if (bwb && typeof bwb.activateScriptEditorTab === 'function') {
+        bwb.activateScriptEditorTab();
+        return true;
+      }
+      var btn = document.querySelector('[data-name="pine-dialog-button"]')
+        || document.querySelector('[aria-label="Pine"]');
+      if (btn && btn.getAttribute('aria-pressed') !== 'true') {
+        btn.click();
+        return true;
+      }
+      return false;
     })()
   `);
 

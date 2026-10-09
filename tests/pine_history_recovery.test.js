@@ -765,3 +765,87 @@ test('12. Real getEditorStatus verifies banner, readOnly and blocked statuses', 
   assert.equal(statusC.readOnly, true);
   assert.equal(statusC.isBlocked, true);
 });
+
+
+test('13. Pine Editor uses registered scripteditor widget and verifies Monaco', async () => {
+  let editorVisible = false;
+  const evaluated = [];
+  const { ensurePineEditorOpen } = await loadPineModule({
+    evaluate: async (script) => {
+      evaluated.push(script);
+      if (script.includes("String(window.location.href).includes('/chart')")) return true;
+      if (script.includes("showWidget('scripteditor')")) { editorVisible = true; return true; }
+      if (script.includes('var m =')) return editorVisible;
+      if (script.includes('bottomWidgetBar')) return true;
+      return editorVisible;
+    },
+    getClient: async () => ({})
+  });
+  assert.equal(await ensurePineEditorOpen(), true);
+  assert.equal(editorVisible, true);
+  assert.ok(evaluated.some(x => x.includes("showWidget('scripteditor')")),
+    'Use the registered widget name, not the obsolete pine-editor identifier');
+  assert.ok(!evaluated.some(x => x.includes("showWidget('pine-editor')")),
+    'Never try the unregistered widget name');
+});
+
+test('14. Pine Editor opening is not reported successful without a real editor', async () => {
+  const calls = [];
+  const { ensurePineEditorOpen } = await loadPineModule({
+    evaluate: async (script) => {
+      calls.push(script);
+      if (script.includes("String(window.location.href).includes('/chart')")) return true;
+      if (script.includes('bottomWidgetBar')) return true;
+      if (script.includes('var m =')) return false;
+      return false;
+    },
+    getClient: async () => ({})
+  });
+  assert.equal(await ensurePineEditorOpen(), false);
+  assert.ok(calls.some(x => x.includes("showWidget('scripteditor')")),
+    'The correct editor must at least be requested');
+});
+
+
+test('15. UI panel resolves scripteditor and confirms the actual rendered editor', async () => {
+  const uiPath = path.resolve(__dirname, '../src/core/ui.js');
+  const ui = fs.readFileSync(uiPath, 'utf8');
+  const start = ui.indexOf('export async function openPanel(');
+  const end = ui.indexOf('export async function fullscreen(', start);
+  assert.ok(start >= 0 && end > start);
+  const generated = [];
+  const context = vm.createContext({
+    evaluate: async (expression) => {
+      generated.push(expression);
+      if (expression.includes('Widget not registered')) {
+        assert.ok(expression.includes('scripteditor'), 'UI must use registered widget');
+        return { was_open: false, performed: 'opened' };
+      }
+      return { open: true };
+    },
+    setTimeout: (fn) => fn(),
+    Promise,
+    console
+  });
+  vm.runInContext(ui.slice(start, end).replace(/^export /, '') + '\nthis.openPanel = openPanel;', context);
+  const report = await context.openPanel({ panel: 'pine-editor', action: 'open' });
+  assert.equal(report.success, true);
+  assert.equal(report.verified_open, true);
+  assert.equal(generated.length, 2);
+  assert.ok(generated[0].includes('bwb.showWidget("scripteditor")'));
+  assert.ok(generated[1].includes('document.querySelector'));
+});
+
+test('16. UI panel rejects unregistered widget instead of reporting opened', async () => {
+  const uiPath = path.resolve(__dirname, '../src/core/ui.js');
+  const ui = fs.readFileSync(uiPath, 'utf8');
+  const start = ui.indexOf('export async function openPanel(');
+  const end = ui.indexOf('export async function fullscreen(', start);
+  const context = vm.createContext({
+    evaluate: async () => ({ error: 'Widget not registered: scripteditor' }),
+    setTimeout: (fn) => fn(), Promise, console
+  });
+  vm.runInContext(ui.slice(start, end).replace(/^export /, '') + '\nthis.openPanel = openPanel;', context);
+  await assert.rejects(() => context.openPanel({ panel: 'pine-editor', action: 'open' }),
+    /Widget not registered/);
+});
